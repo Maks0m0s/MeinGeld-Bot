@@ -87,6 +87,31 @@ class MonoBot:
         self._loop = None
         self._short_ids = {}
         self._states = {}
+        self._rates_cache = (0, [])
+        self._account_currencies = {}
+
+    def _remember_accounts(self, accounts):
+        for acc in accounts:
+            acc_id = acc.get("id")
+            if acc_id:
+                self._account_currencies[acc_id] = CURRENCIES.get(acc.get("currencyCode"), "UAH")
+
+    async def account_currency(self, account_id):
+        currency = self._account_currencies.get(account_id)
+        if not currency:
+            accounts = await asyncio.to_thread(self.api.get_accounts)
+            self._remember_accounts(accounts)
+            currency = self._account_currencies.get(account_id)
+        return currency or "UAH"
+
+    async def get_rates(self):
+        ts, rates = self._rates_cache
+        if rates and time.time() - ts < 60:
+            return rates
+        rates = await asyncio.to_thread(self.api.get_rates)
+        if rates:
+            self._rates_cache = (time.time(), rates)
+        return rates
 
     # ---------- state helpers ----------
 
@@ -272,7 +297,7 @@ class MonoBot:
     # ---------- annotate flow (spend/income → category → currency → amount) ----------
 
     async def start_annotate(self, message, chat_id):
-        cats = await asyncio.to_thread(self.budget.categories, chat_id)
+        cats = await asyncio.to_thread(self.budget.categories)
         if not cats:
             await message.reply_text(
                 "🚫 No categories yet.\n\n➕ Create one in 💰 Budget → ➕ Add category",
@@ -286,8 +311,8 @@ class MonoBot:
             reply_markup=self.annotate_kind_menu(),
         )
 
-    def annotate_category_menu(self, kind, chat_id, back="ann:start"):
-        cats = self.storage.get_categories(chat_id)
+    def annotate_category_menu(self, kind, back="ann:start"):
+        cats = self.storage.get_categories()
         rows = [
             [InlineKeyboardButton(f"🏷 {c['name']}", callback_data=f"anncat:{kind}:{c['id']}")]
             for c in cats
@@ -331,14 +356,14 @@ class MonoBot:
         if step in ("in", "out"):
             kind = step
             kind_label = "📈 Income" if kind == "in" else "📉 Spend"
-            cats = await asyncio.to_thread(self.budget.categories, chat_id)
+            cats = await asyncio.to_thread(self.budget.categories)
             if not cats:
                 await query.edit_message_text("🚫 No categories yet", reply_markup=self.annotate_kind_menu())
                 return
             await query.edit_message_text(
                 f"✏️ {kind_label}\n\n🏷 Where?",
                 parse_mode="Markdown",
-                reply_markup=self.annotate_category_menu(kind, chat_id),
+                reply_markup=self.annotate_category_menu(kind),
             )
             return
 
@@ -347,7 +372,7 @@ class MonoBot:
 
         if step == "anncat":
             cat_id = int(rest[1])
-            cat = await asyncio.to_thread(self.storage.get_category, chat_id, cat_id)
+            cat = await asyncio.to_thread(self.storage.get_category, cat_id)
             await query.edit_message_text(
                 f"✏️ {kind_label} → _{cat['name']}_\n\n💱 Currency?",
                 parse_mode="Markdown",
@@ -394,8 +419,8 @@ class MonoBot:
                 return
         sign = 1 if kind == "in" else -1
         delta = sign * uah_amount
-        cat = await asyncio.to_thread(self.storage.get_category, chat_id, cat_id)
-        await asyncio.to_thread(self.budget.annotate_external, chat_id, cat_id, delta)
+        cat = await asyncio.to_thread(self.storage.get_category, cat_id)
+        await asyncio.to_thread(self.budget.annotate_external, cat_id, delta)
         icon = "📈" if kind == "in" else "📉"
         kind_label = "Income" if kind == "in" else "Spend"
         note = "" if currency == "UAH" else f" ({flag(currency)} {amount:g} {currency})"
@@ -416,7 +441,7 @@ class MonoBot:
 
         if kind == "addcat":
             self.pop_state(chat_id)
-            cat_id = await asyncio.to_thread(self.budget.add_category, chat_id, text)
+            cat_id = await asyncio.to_thread(self.budget.add_category, text)
             if cat_id is None:
                 await update.message.reply_text("⚠️ Category already exists", reply_markup=self.budget_menu())
             else:
@@ -490,8 +515,8 @@ class MonoBot:
                 return
         sign = 1 if kind == "in" else -1
         delta = sign * uah_amount
-        cat = await asyncio.to_thread(self.storage.get_category, chat_id, cat_id)
-        await asyncio.to_thread(self.budget.annotate_external, chat_id, cat_id, delta)
+        cat = await asyncio.to_thread(self.storage.get_category, cat_id)
+        await asyncio.to_thread(self.budget.annotate_external, cat_id, delta)
         icon = "📈" if kind == "in" else "📉"
         kind_label = "Income" if kind == "in" else "Spend"
         note = "" if currency == "UAH" else f" ({flag(currency)} {amount:g} {currency})"
@@ -577,7 +602,7 @@ class MonoBot:
         action = args[0]
 
         if action == "balance":
-            balances = await asyncio.to_thread(self.budget.balances, chat_id)
+            balances = await asyncio.to_thread(self.budget.balances)
             if not balances:
                 await query.edit_message_text("🚫 No categories yet", reply_markup=self.budget_menu())
                 return
@@ -591,7 +616,7 @@ class MonoBot:
                                           parse_mode="Markdown", reply_markup=self.budget_menu())
 
         elif action == "cats":
-            cats = await asyncio.to_thread(self.budget.categories, chat_id)
+            cats = await asyncio.to_thread(self.budget.categories)
             if not cats:
                 await query.edit_message_text("🚫 No categories yet", reply_markup=self.budget_menu())
                 return
@@ -605,7 +630,7 @@ class MonoBot:
             await query.message.reply_text("✏️ Send the category name:", reply_markup=CANCEL_KB)
 
         elif action == "delcat":
-            cats = await asyncio.to_thread(self.budget.categories, chat_id)
+            cats = await asyncio.to_thread(self.budget.categories)
             if not cats:
                 await query.edit_message_text("🚫 No categories to delete", reply_markup=self.budget_menu())
                 return
@@ -621,20 +646,20 @@ class MonoBot:
             )
 
     async def handle_delcat_pick(self, query, chat_id, category_id):
-        cat = await asyncio.to_thread(self.storage.get_category, chat_id, category_id)
+        cat = await asyncio.to_thread(self.storage.get_category, category_id)
         if cat is None:
             await query.edit_message_text("⚠️ Category not found", reply_markup=self.budget_menu())
             return
-        await asyncio.to_thread(self.budget.delete_category, chat_id, category_id)
+        await asyncio.to_thread(self.budget.delete_category, category_id)
         await query.edit_message_text(
             f"🗑 Category *{cat['name']}* deleted", parse_mode="Markdown", reply_markup=self.budget_menu()
         )
 
     # ---------- transactions section ----------
 
-    def _category_keyboard(self, tx_key, chat_id):
+    def _category_keyboard(self, tx_key):
         short = self._short_tx_id(tx_key)
-        cats = self.storage.get_categories(chat_id)
+        cats = self.storage.get_categories()
         buttons = [
             [InlineKeyboardButton(f"🏷 {c['name']}", callback_data=f"cat:{short}:{c['id']}")]
             for c in cats
@@ -642,16 +667,28 @@ class MonoBot:
         buttons.append([InlineKeyboardButton("⏭ Skip", callback_data=f"skip:{short}"), home_btn()])
         return InlineKeyboardMarkup(buttons)
 
+    def fmt_in_uah(self, amount_kop, currency, rates):
+        if currency == "UAH":
+            return fmt_uah(amount_kop)
+        if not rates:
+            return fmt_amount(amount_kop, currency)
+        try:
+            uah = self.api.to_uah(rates, amount_kop / 100.0, currency)
+            return fmt_uah(int(round(uah * 100)))
+        except Exception:
+            return fmt_amount(amount_kop, currency)
+
     async def prompt_category(self, chat_id, tx):
         tx_key = tx["tx_key"]
         kind = "📈 Income" if tx["amount"] >= 0 else "📉 Spend"
+        rates = await self.get_rates()
         text = (
-            f"{kind}: *{fmt_amount(tx['amount'], tx['currency'])}*\n"
+            f"{kind}: *{self.fmt_in_uah(tx['amount'], tx['currency'], rates)}*\n"
             f"_{tx['description']}_\n"
             f"🕐 {time.strftime('%d.%m %Y %H:%M', time.localtime(tx['time']))}\n\n"
             f"🏷 Choose a category:"
         )
-        keyboard = self._category_keyboard(tx_key, chat_id)
+        keyboard = self._category_keyboard(tx_key)
         try:
             await self.app.bot.send_message(
                 chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=keyboard
@@ -663,7 +700,7 @@ class MonoBot:
         action = args[0]
 
         if action == "pending":
-            txs = await asyncio.to_thread(self.budget.unannotated, chat_id)
+            txs = await asyncio.to_thread(self.budget.unannotated)
             if not txs:
                 await query.edit_message_text("✅ All transactions annotated!", reply_markup=self.tx_menu())
                 return
@@ -676,20 +713,21 @@ class MonoBot:
                 await self.prompt_category(chat_id, tx)
 
         elif action == "history":
-            txs = await asyncio.to_thread(self.budget.recent_transactions, chat_id, 10)
+            txs = await asyncio.to_thread(self.budget.recent_transactions, 10)
             if not txs:
                 await query.edit_message_text("🚫 No transactions yet", reply_markup=self.tx_menu())
                 return
+            rates = await self.get_rates()
             lines = []
             for tx in txs:
                 icon = "📈" if tx["amount"] >= 0 else "📉"
                 cat = ""
                 if tx["category_id"]:
-                    c = self.storage.get_category(chat_id, tx["category_id"])
+                    c = self.storage.get_category(tx["category_id"])
                     cat = f" 🏷_{c['name']}_" if c else ""
                 lines.append(
                     f"{icon} {time.strftime('%d.%m %H:%M', time.localtime(tx['tx_time']))} "
-                    f"*{fmt_amount(tx['amount'], tx['currency'])}* _{tx['description']}_"
+                    f"*{self.fmt_in_uah(tx['amount'], tx['currency'], rates)}* _{tx['description']}_"
                     f"{cat}"
                 )
             await query.edit_message_text(
@@ -708,9 +746,9 @@ class MonoBot:
             )
             return
         category_id = int(data[-1])
-        rates = await asyncio.to_thread(self.api.get_rates)
+        rates = await self.get_rates()
         category, error = await asyncio.to_thread(
-            self.budget.annotate_transaction, tx_key, chat_id, category_id, rates
+            self.budget.annotate_transaction, tx_key, category_id, rates
         )
         if error:
             await query.edit_message_text(query.message.text + f"\n\n⚠️ {error}")
@@ -778,6 +816,7 @@ class MonoBot:
                 await query.edit_message_text(f"⚠️ Cannot get accounts: {self.api.last_error}",
                                                reply_markup=self.settings_menu())
                 return
+            self._remember_accounts(accounts)
             lines = []
             for acc in accounts:
                 currency = CURRENCIES.get(acc.get("currencyCode"), "?")
@@ -867,8 +906,7 @@ class MonoBot:
         )
 
     async def cmd_balance(self, update, context):
-        chat_id = update.effective_chat.id
-        balances = await asyncio.to_thread(self.budget.balances, chat_id)
+        balances = await asyncio.to_thread(self.budget.balances)
         if not balances:
             await update.message.reply_text("🚫 No categories yet", reply_markup=MAIN_MENU)
             return
@@ -890,13 +928,13 @@ class MonoBot:
                 await update.message.reply_text("⚠️ Usage: /ext +500 Aliments", reply_markup=MAIN_MENU)
                 return
             name = " ".join(context.args[1:])
-            cat = await asyncio.to_thread(self.storage.get_category_by_name, chat_id, name)
+            cat = await asyncio.to_thread(self.storage.get_category_by_name, name)
             if cat is None:
-                cats = await asyncio.to_thread(self.budget.categories, chat_id)
+                cats = await asyncio.to_thread(self.budget.categories)
                 names = ", ".join(c["name"] for c in cats)
                 await update.message.reply_text(f"⚠️ Category not found. Existing: {names}", reply_markup=MAIN_MENU)
                 return
-            await asyncio.to_thread(self.budget.annotate_external, chat_id, cat["id"], delta)
+            await asyncio.to_thread(self.budget.annotate_external, cat["id"], delta)
             emoji = "📈" if delta >= 0 else "📉"
             await update.message.reply_text(
                 f"{emoji} *{fmt_uah(int(round(delta * 100)))}* → _{cat['name']}_",
@@ -911,7 +949,7 @@ class MonoBot:
 
     async def cmd_pending(self, update, context):
         chat_id = update.effective_chat.id
-        txs = await asyncio.to_thread(self.budget.unannotated, chat_id)
+        txs = await asyncio.to_thread(self.budget.unannotated)
         if not txs:
             await update.message.reply_text("✅ All transactions annotated!", reply_markup=MAIN_MENU)
             return
@@ -923,6 +961,7 @@ class MonoBot:
         if not accounts:
             await update.message.reply_text(f"⚠️ Cannot get accounts: {self.api.last_error}", reply_markup=MAIN_MENU)
             return
+        self._remember_accounts(accounts)
         lines = []
         for acc in accounts:
             currency = CURRENCIES.get(acc.get("currencyCode"), "?")
@@ -951,35 +990,38 @@ class MonoBot:
 
     # ---------- transaction ingestion ----------
 
-    async def ingest_transactions(self, chat_id, account_id, statements):
-        rates = await asyncio.to_thread(self.api.get_rates)
+    async def ingest_transactions(self, account_id, statements, account_currency):
         new_txs = await asyncio.to_thread(
-            self.budget.process_statement_transactions, chat_id, account_id, statements, rates
+            self.budget.process_statement_transactions, account_id, statements, account_currency
         )
-        for tx in new_txs:
-            await self.prompt_category(chat_id, tx)
+        if not new_txs:
+            return
+        chat_ids = await asyncio.to_thread(self.storage.get_users)
+        for chat_id in chat_ids:
+            for tx in new_txs:
+                await self.prompt_category(chat_id, tx)
 
     async def poll_once(self):
-        for chat_id in await asyncio.to_thread(self.storage.get_users):
-            accounts = await asyncio.to_thread(self.api.get_accounts)
-            if not accounts:
-                log.warning("No accounts for chat %s: %s", chat_id, self.api.last_error)
+        accounts = await asyncio.to_thread(self.api.get_accounts)
+        if not accounts:
+            log.warning("No accounts: %s", self.api.last_error)
+            return
+        self._remember_accounts(accounts)
+        now = int(time.time())
+        for acc in accounts:
+            acc_id = acc["id"]
+            account_currency = self._account_currencies.get(acc_id, "UAH")
+            last_ts = await asyncio.to_thread(self.storage.get_account_last_ts, acc_id)
+            if last_ts is None:
+                last_ts = now - 24 * 3600
+            statements = await asyncio.to_thread(self.api.get_statement, acc_id, last_ts, now)
+            if statements is None:
+                log.warning("Statement error for %s: %s", acc_id, self.api.last_error)
                 continue
-            now = int(time.time())
-            for acc in accounts:
-                acc_id = acc["id"]
-                last_ts = await asyncio.to_thread(self.storage.get_account_last_ts, acc_id, chat_id)
-                if last_ts is None:
-                    last_ts = now - 24 * 3600
-                statements = await asyncio.to_thread(self.api.get_statement, acc_id, last_ts, now)
-                if statements is None:
-                    log.warning("Statement error for %s: %s", acc_id, self.api.last_error)
-                    continue
-                max_ts = max((item.get("time", 0) for item in statements), default=last_ts)
-                await asyncio.to_thread(self.storage.set_account_last_ts, acc_id, chat_id, max(last_ts, max_ts))
-                if statements:
-                    await self.ingest_transactions(chat_id, acc_id, statements)
-            await asyncio.sleep(1)
+            max_ts = max((item.get("time", 0) for item in statements), default=last_ts)
+            await asyncio.to_thread(self.storage.set_account_last_ts, acc_id, max(last_ts, max_ts))
+            if statements:
+                await self.ingest_transactions(acc_id, statements, account_currency)
 
     async def poll_job(self, context: ContextTypes.DEFAULT_TYPE):
         try:
@@ -992,11 +1034,12 @@ class MonoBot:
     async def handle_webhook_payload(self, payload):
         if isinstance(payload, dict):
             payload = [payload]
-        chat_ids = await asyncio.to_thread(self.storage.get_users)
+        by_account = {}
         for item in payload:
-            account_id = item.get("accountId", "")
-            for chat_id in chat_ids:
-                await self.ingest_transactions(chat_id, account_id, [item])
+            by_account.setdefault(item.get("accountId", ""), []).append(item)
+        for account_id, items in by_account.items():
+            account_currency = await self.account_currency(account_id)
+            await self.ingest_transactions(account_id, items, account_currency)
 
     def start_webhook_server(self):
         bot = self
