@@ -1,4 +1,4 @@
-from controller import AppController
+from bot import MonoBot
 
 if __name__ == "__main__":
-    AppController().run()
+    MonoBot().run()

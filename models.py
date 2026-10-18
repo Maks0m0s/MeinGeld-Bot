@@ -1,55 +1,99 @@
 import time
+
 import requests
-from env import RATE_URL, PERSONAL_URL, TOKEN
 
-api_headers = {"X-Token": TOKEN}
+from env import (
+    MONOBANK_TOKEN,
+    RATE_URL,
+    PERSONAL_URL,
+    STATEMENTS_URL,
+    WEBHOOK_URL,
+)
 
-class BankModel:
-    CURRENCIES = {840: "USD", 978: "EUR", 980: "UAH"}
-    def __init__(self):
-        self._get_rates_tries = 0
+CURRENCIES = {840: "USD", 978: "EUR", 980: "UAH"}
+CURRENCY_NAMES = {value: key for key, value in CURRENCIES.items()}
+
+
+class MonobankAPI:
+    def __init__(self, token=MONOBANK_TOKEN):
+        self.token = token
+        self.session = requests.Session()
+        self.session.headers["X-Token"] = token
         self.last_error = ""
+        self._retries = 0
 
-class CurrencyModel(BankModel):
-    def get_rates(self, on_retry=None):
+    def _get(self, url, on_retry=None):
         self.last_error = ""
         try:
-            response = requests.get(RATE_URL)
-            response.raise_for_status()
-            rates = response.json()
-
-            result = []
-            for rate in rates:
-                code_a = rate["currencyCodeA"]
-                code_b = rate["currencyCodeB"]
-                if code_a in self.CURRENCIES and code_b in self.CURRENCIES:
-                    result.append(rate)
-
-            self._get_rates_tries = 0
-            return result
-        except Exception as ex:
-            if str(ex).startswith("429 Client Error: Too Many Requests") and self._get_rates_tries < 3:
+            response = self.session.get(url)
+            if response.status_code == 429 and self._retries < 3:
+                self._retries += 1
                 if on_retry:
                     on_retry()
                 time.sleep(1)
-                self._get_rates_tries += 1
-                return self.get_rates(on_retry)
-            else:
-                self.last_error = str(ex)
-                return []
+                return self._get(url, on_retry)
+            response.raise_for_status()
+            self._retries = 0
+            return response.json()
+        except Exception as ex:
+            self.last_error = str(ex)
+            return None
+
+    def _post(self, url, payload):
+        self.last_error = ""
+        try:
+            response = self.session.post(url, json=payload)
+            response.raise_for_status()
+            return True
+        except Exception as ex:
+            self.last_error = str(ex)
+            return False
+
+    def _delete(self, url):
+        self.last_error = ""
+        try:
+            response = self.session.delete(url)
+            response.raise_for_status()
+            return True
+        except Exception as ex:
+            self.last_error = str(ex)
+            return False
+
+    def get_rates(self, on_retry=None):
+        rates = self._get(RATE_URL, on_retry=on_retry)
+        if rates is None:
+            return []
+        return [
+            rate
+            for rate in rates
+            if rate["currencyCodeA"] in CURRENCIES and rate["currencyCodeB"] in CURRENCIES
+        ]
+
+    def get_client_info(self, on_retry=None):
+        return self._get(PERSONAL_URL, on_retry=on_retry)
+
+    def get_accounts(self, on_retry=None):
+        info = self.get_client_info(on_retry=on_retry)
+        if not info:
+            return []
+        return info.get("accounts", [])
+
+    def get_statement(self, account_id, from_ts, to_ts, on_retry=None):
+        url = STATEMENTS_URL.format(account=account_id, from_ts=int(from_ts), to_ts=int(to_ts))
+        return self._get(url, on_retry=on_retry) or []
+
+    def set_webhook(self, webhook_url):
+        return self._post(WEBHOOK_URL, {"webHookUrl": webhook_url})
+
+    def delete_webhook(self):
+        return self._delete(WEBHOOK_URL)
 
     def convert(self, rates, in_currency, out_currency, in_amount):
         if in_currency == out_currency:
             return in_amount
 
-        in_code = None
-        out_code = None
-        for code, currency in self.CURRENCIES.items():
-            if currency == in_currency:
-                in_code = code
-            if currency == out_currency:
-                out_code = code
-
+        in_code = CURRENCY_NAMES.get(in_currency)
+        out_code = CURRENCY_NAMES.get(out_currency)
         if in_code is None or out_code is None:
             raise ValueError("Unknown currency")
 
@@ -69,40 +113,7 @@ class CurrencyModel(BankModel):
 
         raise ValueError(f"Rate not found: {in_currency} -> {out_currency}")
 
-class AccountModel(BankModel):
-    def get_user(self, on_retry=None):
-        try:
-            response = requests.get(PERSONAL_URL, headers=api_headers)
-            if response.ok:
-                data = response.json()
-                self._get_rates_tries = 0
-                return data.get("name")
-        except Exception as ex:
-            if str(ex).startswith("429 Client Error: Too Many Requests") and self._get_rates_tries < 3:
-                if on_retry:
-                    on_retry()
-                time.sleep(1)
-                self._get_rates_tries += 1
-                return self.get_user(on_retry)
-            else:
-                self.last_error = str(ex)
-                return
-
-    def get_all_cards(self, on_retry=None):
-        try:
-            response = requests.get(PERSONAL_URL, headers=api_headers)
-            if response.ok:
-                data = response.json()
-                cards = data.get("accounts", [])
-                self._get_rates_tries = 0
-                return cards
-        except Exception as ex:
-            if str(ex).startswith("429 Client Error: Too Many Requests") and self._get_rates_tries < 3:
-                if on_retry:
-                    on_retry()
-                time.sleep(1)
-                self._get_rates_tries += 1
-                return self.get_user(on_retry)
-            else:
-                self.last_error = str(ex)
-                return
+    def to_uah(self, rates, amount, currency):
+        if currency == "UAH":
+            return amount
+        return self.convert(rates, currency, "UAH", amount)
